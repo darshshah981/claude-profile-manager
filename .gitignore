@@ -1,0 +1,12 @@
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# User-specific configs (don't commit personal settings)
+config-personal.json
+
+# Testing artifacts
+test-output/
+*.log
