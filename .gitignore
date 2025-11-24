@@ -1,11 +1,13 @@
-# Temporary files
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
 *.swp
 *.swo
 *~
-.DS_Store
-
-# User-specific configs (don't commit personal settings)
-config-personal.json
+.idea/
+.vscode/
 
 # Testing artifacts
 test-output/

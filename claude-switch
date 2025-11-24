@@ -1,0 +1,527 @@
+#!/bin/bash
+# claude-switch - Profile switcher for Claude Code
+# https://github.com/darshshah981/claude-profile-manager
+#
+# Switches between personal and corporate Claude Code profiles,
+# syncing plugins, MCP servers, and optionally npm registries.
+#
+# Usage: claude-switch [personal|corporate|status|init]
+
+set -e
+
+VERSION="2.0.0"
+CLAUDE_DIR="$HOME/.claude"
+PROFILES_DIR="$CLAUDE_DIR/profiles"
+CONFIG_FILE="$PROFILES_DIR/config.sh"
+
+# Colors (degrade gracefully if not supported)
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    YELLOW='\033[0;33m'
+    RED='\033[0;31m'
+    DIM='\033[2m'
+    RESET='\033[0m'
+else
+    BOLD='' GREEN='' BLUE='' YELLOW='' RED='' DIM='' RESET=''
+fi
+
+# ============================================================================
+# DEFAULT CONFIGURATION (override in ~/.claude/profiles/config.sh)
+# ============================================================================
+
+# Profile names (customize these)
+PERSONAL_PROFILE_NAME="personal"
+CORPORATE_PROFILE_NAME="corporate"
+
+# Corporate gateway settings
+CORPORATE_GATEWAY_URL=""  # e.g., "https://ai-gateway.yourcompany.com"
+CORPORATE_GATEWAY_NAME="" # e.g., "portkey" or "aws-bedrock"
+CORPORATE_SSO_PROVIDER="" # e.g., "okta" or "azure-ad"
+
+# NPM registry settings (leave empty to skip npm switching)
+CORPORATE_NPM_REGISTRY="" # e.g., "https://artifactory.yourcompany.com/api/npm/npm-all/"
+CORPORATE_NPM_SCOPE=""    # e.g., "@yourcompany" (optional)
+
+# Feature flags
+SYNC_PLUGINS=true         # Sync enabledPlugins across profiles
+SYNC_MCP_SERVERS=true     # Sync mcpServers across profiles
+SWITCH_NPM_REGISTRY=false # Switch npm registry (set to true if needed)
+BACKUP_TOKENS=true        # Backup/restore authentication tokens
+
+# Detection patterns (how to identify corporate profile)
+CORPORATE_DETECTION_PATTERN="apiKeyHelper"  # Pattern in settings.json
+CORPORATE_NPM_PATTERN=""  # Pattern in npm registry URL to detect corporate
+
+# ============================================================================
+# LOAD USER CONFIGURATION
+# ============================================================================
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+log_info() { echo -e "${BLUE}INFO${RESET} $1"; }
+log_success() { echo -e "${GREEN}OK${RESET} $1"; }
+log_warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
+log_error() { echo -e "${RED}ERROR${RESET} $1"; }
+log_step() { echo -e "\n${BOLD}[$1]${RESET} $2"; }
+
+detect_current_profile() {
+    if [[ -f "$CLAUDE_DIR/settings.json" ]]; then
+        if grep -q "$CORPORATE_DETECTION_PATTERN" "$CLAUDE_DIR/settings.json" 2>/dev/null; then
+            echo "corporate"
+        else
+            echo "personal"
+        fi
+    else
+        echo "none"
+    fi
+}
+
+detect_npm_registry() {
+    if [[ -z "$CORPORATE_NPM_PATTERN" ]]; then
+        echo "unknown"
+        return
+    fi
+    local registry
+    registry=$(npm config get registry 2>/dev/null || echo "")
+    if [[ "$registry" == *"$CORPORATE_NPM_PATTERN"* ]]; then
+        echo "corporate"
+    else
+        echo "personal"
+    fi
+}
+
+ensure_profiles_dir() {
+    mkdir -p "$PROFILES_DIR"
+    mkdir -p "$PROFILES_DIR/tokens-personal"
+    mkdir -p "$PROFILES_DIR/tokens-corporate"
+}
+
+# ============================================================================
+# SYNC FUNCTIONS
+# ============================================================================
+
+sync_settings() {
+    if [[ "$SYNC_PLUGINS" != true && "$SYNC_MCP_SERVERS" != true ]]; then
+        return
+    fi
+
+    if ! command -v python3 &> /dev/null; then
+        log_warn "Python3 not found, skipping settings sync"
+        return
+    fi
+
+    local personal_file="$PROFILES_DIR/${PERSONAL_PROFILE_NAME}-settings.json"
+    local corporate_file="$PROFILES_DIR/${CORPORATE_PROFILE_NAME}-settings.json"
+
+    if [[ ! -f "$personal_file" ]] || [[ ! -f "$corporate_file" ]]; then
+        return
+    fi
+
+    python3 << PYTHON_SYNC
+import json
+import os
+import sys
+
+sync_plugins = ${SYNC_PLUGINS,,} == "true"
+sync_mcp = ${SYNC_MCP_SERVERS,,} == "true"
+
+personal_file = "$personal_file"
+corporate_file = "$corporate_file"
+
+try:
+    with open(personal_file, 'r') as f:
+        personal = json.load(f)
+    with open(corporate_file, 'r') as f:
+        corporate = json.load(f)
+
+    if sync_plugins:
+        personal_plugins = personal.get('enabledPlugins', {})
+        corporate_plugins = corporate.get('enabledPlugins', {})
+        merged_plugins = {**personal_plugins, **corporate_plugins}
+        personal['enabledPlugins'] = merged_plugins
+        corporate['enabledPlugins'] = merged_plugins
+        print("  Synced enabledPlugins across profiles")
+
+    if sync_mcp:
+        personal_mcp = personal.get('mcpServers', {})
+        corporate_mcp = corporate.get('mcpServers', {})
+        merged_mcp = {**personal_mcp, **corporate_mcp}
+        personal['mcpServers'] = merged_mcp
+        corporate['mcpServers'] = merged_mcp
+        print("  Synced mcpServers across profiles")
+
+    with open(personal_file, 'w') as f:
+        json.dump(personal, f, indent=2)
+    with open(corporate_file, 'w') as f:
+        json.dump(corporate, f, indent=2)
+
+except Exception as e:
+    print(f"  Sync failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SYNC
+}
+
+# ============================================================================
+# BACKUP/RESTORE FUNCTIONS
+# ============================================================================
+
+backup_current_profile() {
+    local current
+    current=$(detect_current_profile)
+
+    if [[ "$current" == "none" ]]; then
+        return
+    fi
+
+    if [[ "$current" == "corporate" ]]; then
+        cp "$CLAUDE_DIR/settings.json" "$PROFILES_DIR/${CORPORATE_PROFILE_NAME}-settings.json" 2>/dev/null || true
+        if [[ -f "$CLAUDE_DIR/gateway-helper-config.json" ]]; then
+            cp "$CLAUDE_DIR/gateway-helper-config.json" "$PROFILES_DIR/${CORPORATE_PROFILE_NAME}-gateway-config.json" 2>/dev/null || true
+        fi
+        if [[ "$BACKUP_TOKENS" == true ]] && ls "$CLAUDE_DIR/tokens/"* &>/dev/null; then
+            cp "$CLAUDE_DIR/tokens/"* "$PROFILES_DIR/tokens-corporate/" 2>/dev/null || true
+            log_success "Backed up corporate tokens"
+        fi
+    else
+        cp "$CLAUDE_DIR/settings.json" "$PROFILES_DIR/${PERSONAL_PROFILE_NAME}-settings.json" 2>/dev/null || true
+        if [[ "$BACKUP_TOKENS" == true ]] && ls "$CLAUDE_DIR/tokens/"* &>/dev/null; then
+            cp "$CLAUDE_DIR/tokens/"* "$PROFILES_DIR/tokens-personal/" 2>/dev/null || true
+            log_success "Backed up personal tokens"
+        fi
+    fi
+}
+
+# ============================================================================
+# NPM SWITCHING
+# ============================================================================
+
+switch_npm_corporate() {
+    if [[ "$SWITCH_NPM_REGISTRY" != true ]] || [[ -z "$CORPORATE_NPM_REGISTRY" ]]; then
+        return
+    fi
+
+    npm config set registry "$CORPORATE_NPM_REGISTRY" 2>/dev/null
+    if [[ -n "$CORPORATE_NPM_SCOPE" ]]; then
+        npm config set "${CORPORATE_NPM_SCOPE}:registry" "$CORPORATE_NPM_REGISTRY" 2>/dev/null
+    fi
+    log_success "NPM registry: $CORPORATE_NPM_REGISTRY"
+}
+
+switch_npm_personal() {
+    if [[ "$SWITCH_NPM_REGISTRY" != true ]]; then
+        return
+    fi
+
+    npm config delete registry 2>/dev/null || true
+    if [[ -n "$CORPORATE_NPM_SCOPE" ]]; then
+        npm config delete "${CORPORATE_NPM_SCOPE}:registry" 2>/dev/null || true
+    fi
+    log_success "NPM registry: https://registry.npmjs.org (default)"
+}
+
+# ============================================================================
+# PROFILE SWITCHING
+# ============================================================================
+
+switch_to_corporate() {
+    echo ""
+    echo -e "${BOLD}${GREEN}Switching to ${CORPORATE_PROFILE_NAME^^} Profile${RESET}"
+    echo "========================================"
+
+    log_step "1/4" "Backing up current configuration..."
+    backup_current_profile
+
+    log_step "2/4" "Syncing plugins and MCP servers..."
+    sync_settings
+
+    log_step "3/4" "Switching Claude authentication..."
+    local settings_file="$PROFILES_DIR/${CORPORATE_PROFILE_NAME}-settings.json"
+    local gateway_file="$PROFILES_DIR/${CORPORATE_PROFILE_NAME}-gateway-config.json"
+
+    if [[ ! -f "$settings_file" ]]; then
+        log_warn "${CORPORATE_PROFILE_NAME}-settings.json not found"
+        log_info "Run 'claude-switch init' to set up profiles"
+    else
+        cp "$settings_file" "$CLAUDE_DIR/settings.json"
+        log_success "Loaded ${CORPORATE_PROFILE_NAME} settings"
+    fi
+
+    if [[ -f "$gateway_file" ]]; then
+        cp "$gateway_file" "$CLAUDE_DIR/gateway-helper-config.json"
+        log_success "Configured gateway"
+    fi
+
+    if [[ "$BACKUP_TOKENS" == true ]]; then
+        local token_dir="$PROFILES_DIR/tokens-corporate"
+        if [[ -d "$token_dir" ]] && [[ "$(ls -A "$token_dir" 2>/dev/null)" ]]; then
+            mkdir -p "$CLAUDE_DIR/tokens"
+            cp "$token_dir/"* "$CLAUDE_DIR/tokens/" 2>/dev/null || true
+            log_success "Restored corporate tokens"
+        else
+            log_warn "No corporate tokens found (may need to re-authenticate)"
+        fi
+    fi
+
+    log_step "4/4" "Switching NPM registry..."
+    switch_npm_corporate
+
+    echo ""
+    echo "========================================"
+    echo -e "${BOLD}${GREEN}${CORPORATE_PROFILE_NAME^^} Profile Active${RESET}"
+    echo "========================================"
+    echo ""
+    if [[ -n "$CORPORATE_GATEWAY_URL" ]]; then
+        echo -e "${BOLD}Gateway:${RESET} $CORPORATE_GATEWAY_URL"
+    fi
+    echo -e "${BOLD}Next:${RESET} Run 'claude' to start"
+    echo ""
+}
+
+switch_to_personal() {
+    echo ""
+    echo -e "${BOLD}${BLUE}Switching to ${PERSONAL_PROFILE_NAME^^} Profile${RESET}"
+    echo "========================================"
+
+    log_step "1/4" "Backing up current configuration..."
+    backup_current_profile
+
+    log_step "2/4" "Syncing plugins and MCP servers..."
+    sync_settings
+
+    log_step "3/4" "Switching Claude authentication..."
+    local settings_file="$PROFILES_DIR/${PERSONAL_PROFILE_NAME}-settings.json"
+
+    if [[ ! -f "$settings_file" ]]; then
+        log_warn "${PERSONAL_PROFILE_NAME}-settings.json not found"
+        echo '{"enabledPlugins":{},"mcpServers":{}}' > "$CLAUDE_DIR/settings.json"
+        log_info "Created minimal settings"
+    else
+        cp "$settings_file" "$CLAUDE_DIR/settings.json"
+        log_success "Loaded ${PERSONAL_PROFILE_NAME} settings"
+    fi
+
+    rm -f "$CLAUDE_DIR/gateway-helper-config.json"
+    log_success "Removed gateway config"
+
+    if [[ "$BACKUP_TOKENS" == true ]]; then
+        local token_dir="$PROFILES_DIR/tokens-personal"
+        if [[ -d "$token_dir" ]] && [[ "$(ls -A "$token_dir" 2>/dev/null)" ]]; then
+            mkdir -p "$CLAUDE_DIR/tokens"
+            cp "$token_dir/"* "$CLAUDE_DIR/tokens/" 2>/dev/null || true
+            log_success "Restored personal tokens"
+        else
+            rm -f "$CLAUDE_DIR/tokens/"* 2>/dev/null || true
+            log_warn "No personal tokens found (run 'claude login')"
+        fi
+    fi
+
+    log_step "4/4" "Switching NPM registry..."
+    switch_npm_personal
+
+    echo ""
+    echo "========================================"
+    echo -e "${BOLD}${BLUE}${PERSONAL_PROFILE_NAME^^} Profile Active${RESET}"
+    echo "========================================"
+    echo ""
+    echo -e "${BOLD}Auth:${RESET} Direct Anthropic (personal subscription)"
+    echo -e "${BOLD}Next:${RESET} Run 'claude' to start"
+    echo ""
+}
+
+# ============================================================================
+# STATUS DISPLAY
+# ============================================================================
+
+show_status() {
+    local current_profile
+    current_profile=$(detect_current_profile)
+
+    echo ""
+    echo -e "${BOLD}Claude Profile Switcher${RESET} v$VERSION"
+    echo "========================================"
+    echo ""
+
+    echo -e "${BOLD}Current Profile:${RESET}"
+    if [[ "$current_profile" == "corporate" ]]; then
+        echo -e "  ${GREEN}${CORPORATE_PROFILE_NAME^^}${RESET}"
+        if [[ -f "$CLAUDE_DIR/gateway-helper-config.json" ]]; then
+            local gateway_url
+            gateway_url=$(grep -o '"gatewayUrl"[[:space:]]*:[[:space:]]*"[^"]*"' "$CLAUDE_DIR/gateway-helper-config.json" 2>/dev/null | cut -d'"' -f4)
+            [[ -n "$gateway_url" ]] && echo "  Gateway: $gateway_url"
+        fi
+    elif [[ "$current_profile" == "personal" ]]; then
+        echo -e "  ${BLUE}${PERSONAL_PROFILE_NAME^^}${RESET}"
+        echo "  Auth: Direct Anthropic"
+    else
+        echo -e "  ${YELLOW}NOT CONFIGURED${RESET}"
+    fi
+
+    if [[ "$SWITCH_NPM_REGISTRY" == true ]] && [[ -n "$CORPORATE_NPM_PATTERN" ]]; then
+        echo ""
+        echo -e "${BOLD}NPM Registry:${RESET}"
+        local npm_profile
+        npm_profile=$(detect_npm_registry)
+        if [[ "$npm_profile" == "corporate" ]]; then
+            echo -e "  ${GREEN}Corporate${RESET}"
+        else
+            echo -e "  ${BLUE}Public (npmjs.org)${RESET}"
+        fi
+    fi
+
+    echo ""
+    echo "========================================"
+    echo ""
+    echo -e "${BOLD}Usage:${RESET}"
+    echo "  claude-switch ${PERSONAL_PROFILE_NAME}    Switch to personal profile"
+    echo "  claude-switch ${CORPORATE_PROFILE_NAME}   Switch to corporate profile"
+    echo "  claude-switch status     Show current status"
+    echo "  claude-switch init       Initialize configuration"
+    echo ""
+    echo -e "${DIM}Config: $CONFIG_FILE${RESET}"
+    echo ""
+}
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+init_config() {
+    ensure_profiles_dir
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log_warn "Config file already exists: $CONFIG_FILE"
+        read -rp "Overwrite? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    cat > "$CONFIG_FILE" << 'CONFIG'
+#!/bin/bash
+# claude-switch configuration
+# Edit this file to customize your profile switching behavior
+
+# ============================================================================
+# PROFILE NAMES
+# ============================================================================
+# Customize the names of your profiles
+PERSONAL_PROFILE_NAME="personal"
+CORPORATE_PROFILE_NAME="corporate"
+
+# ============================================================================
+# CORPORATE GATEWAY SETTINGS
+# ============================================================================
+# Your corporate AI gateway URL (leave empty if not using a gateway)
+CORPORATE_GATEWAY_URL=""  # e.g., "https://ai-gateway.yourcompany.com"
+
+# Gateway provider name
+CORPORATE_GATEWAY_NAME="" # e.g., "portkey", "aws-bedrock", "azure-openai"
+
+# SSO provider for authentication
+CORPORATE_SSO_PROVIDER="" # e.g., "okta", "azure-ad", "google"
+
+# ============================================================================
+# NPM REGISTRY SETTINGS
+# ============================================================================
+# Corporate npm registry URL (leave empty to skip npm switching)
+CORPORATE_NPM_REGISTRY="" # e.g., "https://artifactory.yourcompany.com/api/npm/npm-all/"
+
+# Optional: npm scope for corporate packages
+CORPORATE_NPM_SCOPE=""    # e.g., "@yourcompany"
+
+# ============================================================================
+# FEATURE FLAGS
+# ============================================================================
+# Set to true/false to enable/disable features
+
+# Sync plugins between profiles (recommended: true)
+SYNC_PLUGINS=true
+
+# Sync MCP servers between profiles (recommended: true)
+SYNC_MCP_SERVERS=true
+
+# Switch npm registry when changing profiles
+SWITCH_NPM_REGISTRY=false
+
+# Backup and restore authentication tokens
+BACKUP_TOKENS=true
+
+# ============================================================================
+# DETECTION PATTERNS
+# ============================================================================
+# How claude-switch detects which profile is currently active
+
+# Pattern in settings.json that indicates corporate profile
+CORPORATE_DETECTION_PATTERN="apiKeyHelper"
+
+# Pattern in npm registry URL that indicates corporate registry
+CORPORATE_NPM_PATTERN=""  # e.g., "artifactory" or "yourcompany"
+CONFIG
+
+    echo ""
+    log_success "Created config file: $CONFIG_FILE"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Edit $CONFIG_FILE"
+    echo "  2. Configure your corporate gateway URL and settings"
+    echo "  3. Run 'claude-switch ${CORPORATE_PROFILE_NAME}' or 'claude-switch ${PERSONAL_PROFILE_NAME}'"
+    echo ""
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+load_config
+ensure_profiles_dir
+
+case "${1:-}" in
+    personal|"$PERSONAL_PROFILE_NAME")
+        switch_to_personal
+        ;;
+    corporate|"$CORPORATE_PROFILE_NAME")
+        switch_to_corporate
+        ;;
+    status|"")
+        show_status
+        ;;
+    init)
+        init_config
+        ;;
+    --version|-v)
+        echo "claude-switch v$VERSION"
+        ;;
+    --help|-h)
+        echo "claude-switch v$VERSION - Profile switcher for Claude Code"
+        echo ""
+        echo "Usage: claude-switch [command]"
+        echo ""
+        echo "Commands:"
+        echo "  personal    Switch to personal profile"
+        echo "  corporate   Switch to corporate profile"
+        echo "  status      Show current profile status (default)"
+        echo "  init        Initialize configuration file"
+        echo "  --version   Show version"
+        echo "  --help      Show this help"
+        echo ""
+        echo "Configuration: ~/.claude/profiles/config.sh"
+        echo "Documentation: https://github.com/darshshah981/claude-profile-manager"
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        echo "Run 'claude-switch --help' for usage"
+        exit 1
+        ;;
+esac

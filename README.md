@@ -1,226 +1,202 @@
-# Claude Code Profile Switcher
+# claude-switch
 
-A plugin for Claude Code that allows seamless switching between personal and corporate profiles while automatically syncing settings, plugins, and MCP servers.
+A simple shell script to switch between personal and corporate Claude Code profiles.
 
-## Features
+If you use Claude Code both at work (through a corporate AI gateway) and for personal projects (with your own subscription), this tool makes switching between them seamless.
 
-- Switch between personal and corporate Claude Code profiles with a single command
-- Automatic backup of current settings before switching
-- Intelligent sync of enabled plugins and MCP servers across profiles
-- Token management (preserves authentication across switches)
-- npm registry switching support
-- Configurable for any corporate setup
+## What It Does
 
-## Installation
+- **Switches Claude authentication** - Swaps `settings.json` and gateway configurations between profiles
+- **Syncs plugins and MCP servers** - Keeps your extensions consistent across both profiles
+- **Switches npm registry** (optional) - Toggles between corporate Artifactory and public npmjs.org
+- **Manages tokens** - Backs up and restores authentication tokens for each profile
 
-### From Claude Code
+## Quick Start
+
+### 1. Install
 
 ```bash
-claude plugin install profile-switcher
+# Download the script
+curl -o ~/.local/bin/claude-switch https://raw.githubusercontent.com/darshshah981/claude-profile-manager/main/claude-switch
+
+# Make it executable
+chmod +x ~/.local/bin/claude-switch
+
+# Ensure ~/.local/bin is in your PATH
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-### Manual Installation
+Or clone the repo:
 
-1. Clone or download this repository
-2. Place it in `~/.claude/plugins/marketplaces/custom/`
-3. Enable the plugin in Claude Code settings
-
-## Initial Setup
-
-Run the setup command to configure for your organization:
-
-```
-/profile-setup
+```bash
+git clone https://github.com/darshshah981/claude-profile-manager.git
+cd claude-profile-manager
+cp claude-switch ~/.local/bin/
+chmod +x ~/.local/bin/claude-switch
 ```
 
-This will guide you through:
-1. Corporate gateway URL configuration
-2. API key helper path (if using corporate SSO)
-3. npm registry settings
-4. Which settings to sync between profiles
+### 2. Initialize Configuration
 
-## Usage
-
-### Switch to Personal Profile
-
-```
-/switch-personal
+```bash
+claude-switch init
 ```
 
-This will:
-1. Backup current settings to the active profile
-2. Sync common settings (plugins, MCP servers) between profiles
-3. Switch to personal authentication
-4. Restore personal tokens
-5. Configure npm for public registry
+This creates a config file at `~/.claude/profiles/config.sh`. Edit it to match your setup.
 
-### Switch to Corporate Profile
+### 3. Set Up Your Profiles
 
-```
-/switch-corporate
+First, configure Claude Code for your **corporate** profile (with your gateway), then save it:
+
+```bash
+# After configuring corporate Claude Code
+claude-switch corporate
 ```
 
-This will:
-1. Backup current settings to the active profile
-2. Sync common settings (plugins, MCP servers) between profiles
-3. Switch to corporate gateway authentication
-4. Restore corporate tokens
-5. Configure npm for corporate registry
+Then configure Claude Code for your **personal** profile and save it:
 
-### Check Current Profile
-
-```
-/profile-status
+```bash
+# After configuring personal Claude Code
+claude-switch personal
 ```
 
-Shows:
-- Currently active profile
-- Enabled plugins
-- MCP servers configured
-- npm registry
-- Last sync time
+The script will automatically back up your settings when you switch.
+
+### 4. Switch Profiles
+
+```bash
+# Switch to corporate
+claude-switch corporate
+
+# Switch to personal
+claude-switch personal
+
+# Check current status
+claude-switch status
+# or just
+claude-switch
+```
 
 ## Configuration
 
-### Plugin Settings
+Edit `~/.claude/profiles/config.sh` to customize:
 
-The plugin can be configured via Claude Code settings or by editing `~/.claude/profiles/profile-switcher-config.json`:
+```bash
+# Profile names (use any names you want)
+PERSONAL_PROFILE_NAME="personal"
+CORPORATE_PROFILE_NAME="work"  # or "corporate", "enterprise", etc.
 
-```json
-{
-  "corporateGatewayUrl": "https://your-corp-gateway.com",
-  "corporateNpmRegistry": "https://your-npm-registry.com/npm/",
-  "apiKeyHelperPath": "/path/to/gateway-helper/jwt-token-helper.js",
-  "syncSettings": ["enabledPlugins", "mcpServers"],
-  "customNpmCommands": {
-    "onSwitchToCorporate": [
-      "npm config set registry https://your-registry.com"
-    ],
-    "onSwitchToPersonal": [
-      "npm config delete registry"
-    ]
-  }
-}
+# Corporate gateway settings
+CORPORATE_GATEWAY_URL="https://ai-gateway.yourcompany.com"
+CORPORATE_GATEWAY_NAME="portkey"  # or "aws-bedrock", "azure-openai"
+
+# NPM registry (optional - set SWITCH_NPM_REGISTRY=true to enable)
+CORPORATE_NPM_REGISTRY="https://artifactory.yourcompany.com/api/npm/npm-all/"
+SWITCH_NPM_REGISTRY=true
+
+# Feature flags
+SYNC_PLUGINS=true         # Sync plugins across profiles
+SYNC_MCP_SERVERS=true     # Sync MCP servers across profiles
+BACKUP_TOKENS=true        # Backup/restore auth tokens
 ```
-
-### Synced Settings
-
-By default, these settings are synced between profiles:
-- **enabledPlugins**: All enabled plugins (union of both profiles)
-- **mcpServers**: All configured MCP servers (union of both profiles)
-
-Optionally, you can also sync:
-- **alwaysThinkingEnabled**: Thinking mode preference
-
-Settings that are NEVER synced (profile-specific):
-- **apiKeyHelper**: Corporate gateway configuration
-- **tokens**: Authentication tokens (backed up separately)
 
 ## How It Works
 
-### Profile Structure
+### Profile Storage
 
 ```
-~/.claude/
-├── settings.json                    # Active settings (gets replaced on switch)
-├── gateway-helper-config.json       # Corporate gateway config (corporate only)
-├── tokens/                          # Active tokens
-└── profiles/
-    ├── personal-settings.json       # Personal profile backup
-    ├── corporate-settings.json      # Corporate profile backup
-    ├── corporate-gateway-config.json
-    ├── tokens-personal/             # Personal tokens backup
-    └── tokens-corporate/            # Corporate tokens backup
+~/.claude/profiles/
+    config.sh                    # Your configuration
+    personal-settings.json       # Personal Claude settings
+    corporate-settings.json      # Corporate Claude settings
+    corporate-gateway-config.json
+    tokens-personal/             # Personal auth tokens
+    tokens-corporate/            # Corporate auth tokens
 ```
 
-### Switching Process
+### Plugin and MCP Server Sync
 
-1. **Backup Phase**
-   - Detects current profile (checks for `apiKeyHelper` in settings)
-   - Backs up `settings.json` to appropriate profile file
-   - Backs up tokens to appropriate tokens folder
+When you install a plugin or configure an MCP server in one profile, `claude-switch` merges it into both profiles on the next switch. This means:
 
-2. **Sync Phase**
-   - Reads both profile files
-   - Merges specified settings (plugins, MCP servers)
-   - Writes merged settings to both profile files
+1. Install a plugin while using personal profile
+2. Run `claude-switch corporate`
+3. The plugin is now available in corporate profile too
 
-3. **Switch Phase**
-   - Copies target profile settings to `settings.json`
-   - Restores target profile tokens
-   - Configures gateway (if corporate)
+The sync uses Python to merge JSON settings (Python 3 required).
 
-4. **Post-Switch**
-   - Configures npm registry
-   - Displays summary
+### Detection
 
-## Use Cases
+The script detects which profile is active by looking for `apiKeyHelper` in `settings.json`. If found, you're in corporate mode; otherwise, personal mode.
 
-### For Individual Developers
-- Switch between personal Anthropic account and company SSO
-- Keep plugins consistent across both profiles
-- Maintain separate billing
+## Example Output
 
-### For Organizations
-- Standardize profile switching across teams
-- Share corporate gateway configuration
-- Ensure compliance with corporate policies
-
-## Compatibility
-
-- **Claude Code**: v1.0.0+
-- **Python**: 3.6+ (for settings sync)
-- **npm**: Any version (for registry switching)
-- **OS**: Linux, macOS, Windows (WSL)
-
-## Advanced Configuration
-
-### Custom Corporate Setup
-
-For organizations with unique requirements:
-
-1. Fork this plugin
-2. Modify `commands/switch-corporate.md` to include your specific setup
-3. Add custom scripts in `scripts/` directory
-4. Distribute to your team via internal marketplace
-
-### Example: Epic Games Setup
-
-```json
-{
-  "corporateGatewayUrl": "https://live.ai.epicgames.com",
-  "corporateNpmRegistry": "https://artifacts.ol.epicgames.net/artifactory/api/npm/npm-all/",
-  "apiKeyHelperPath": "/home/user/.nvm/versions/node/v22.21.0/lib/node_modules/claude-gateway-helper/dist/jwt-token-helper.js"
-}
 ```
+$ claude-switch corporate
+
+Switching to CORPORATE Profile
+========================================
+
+[1/4] Backing up current configuration...
+OK Backed up personal tokens
+
+[2/4] Syncing plugins and MCP servers...
+  Synced enabledPlugins across profiles
+  Synced mcpServers across profiles
+
+[3/4] Switching Claude authentication...
+OK Loaded corporate settings
+OK Configured gateway
+
+[4/4] Switching NPM registry...
+OK NPM registry: https://artifactory.yourcompany.com/api/npm/npm-all/
+
+========================================
+CORPORATE Profile Active
+========================================
+
+Gateway: https://ai-gateway.yourcompany.com
+Next: Run 'claude' to start
+```
+
+## Requirements
+
+- Bash 4.0+
+- Python 3 (for plugin/MCP sync)
+- npm (if using npm registry switching)
 
 ## Troubleshooting
 
-### Settings not syncing
-- Ensure Python 3 is installed: `python3 --version`
-- Check profile files exist: `ls ~/.claude/profiles/`
+### "Python3 not found, skipping settings sync"
 
-### Tokens not preserved
-- Check tokens backup directories: `ls ~/.claude/profiles/tokens-*`
-- Re-authenticate if needed: `claude logout && claude login`
+Install Python 3:
 
-### npm registry not switching
-- Verify npm is installed: `npm --version`
-- Check current registry: `npm config get registry`
-- Manually set if needed: `npm config set registry <url>`
+```bash
+# Ubuntu/Debian
+sudo apt install python3
 
-## Contributing
+# macOS
+brew install python3
+```
 
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Test with both personal and corporate profiles
-4. Submit a pull request
+### Tokens not persisting
+
+Make sure `BACKUP_TOKENS=true` in your config.
+
+### NPM registry not switching
+
+1. Set `SWITCH_NPM_REGISTRY=true` in config
+2. Set `CORPORATE_NPM_REGISTRY` to your registry URL
+3. Optionally set `CORPORATE_NPM_PATTERN` for detection
+
+### Profile not detected correctly
+
+Adjust `CORPORATE_DETECTION_PATTERN` in config to match something unique in your corporate `settings.json`.
 
 ## License
 
-MIT License - feel free to use and modify for your organization.
+MIT License - see [LICENSE](LICENSE) file.
 
-## Credits
+## Related
 
-Created by Darsh Shah for the Claude Code community.
+- [Claude Code](https://claude.ai/claude-code) - The AI coding assistant this tool supports
+- [Blog post](https://darsh.dev/posts/claude-code-at-work-solving-enterprise-authentication) - Detailed explanation of the enterprise authentication problem and solution
